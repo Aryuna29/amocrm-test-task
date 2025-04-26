@@ -1,0 +1,2 @@
+Ошибка: Bad request
+Код ошибки: 400https://aryunats00.amocrm.ru/api/v4/leads/28377883/notes
