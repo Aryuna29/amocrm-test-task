@@ -8,90 +8,322 @@ define('CODE', 'def5020045637fd5aaa88231ffa562677a227351695ff065dc227c85e79d55cf
 define('REDIRECT_URL', 'https://aryunats00.amocrm.ru');
 
 echo "<pre>";
+/**
+ * Записывает сообщение в лог-файл
+ *
+ * @param string $message Сообщение для логирования
+ * @param string $type Тип сообщения (INFO, ERROR, SUCCESS)
+ * @return void
+ */
+function writeLog($message, $type = 'INFO') {
+    $date = date('Y-m-d H:i:s');
+    $logMessage = "[$date] [$type] $message" . PHP_EOL;
+    file_put_contents("ERROR_LOG.txt", $logMessage, FILE_APPEND);
+}
+
+/**
+ * Получает ID воронки и статусов по их названиям
+ *
+ * @param AmoCrmV4Client $amoV4Client Клиент AmoCRM
+ * @return array Массив с ID воронок и статусов
+ */
+function getPipelinesAndStatuses(AmoCrmV4Client $amoV4Client) {
+    writeLog("Получение списка воронок и статусов...");
+
+    try {
+        // Получаем список всех воронок
+        $pipelines = $amoV4Client->GETRequestApi("leads/pipelines");
+        if (!isset($pipelines['_embedded']['pipelines'])) {
+            writeLog("Ошибка при получении воронок: нет данных в ответе", "ERROR");
+            return null;
+        }
+
+        $result = [
+            'pipelines' => [],
+            'statuses' => []
+        ];
+
+        // Ищем воронку с названием "Воронка"
+        foreach ($pipelines['_embedded']['pipelines'] as $pipeline) {
+            $result['pipelines'][$pipeline['name']] = $pipeline['id'];
+            $result['statuses'][$pipeline['id']] = [];
+
+            // Сохраняем статусы для каждой воронки
+            if (isset($pipeline['_embedded']['statuses'])) {
+                foreach ($pipeline['_embedded']['statuses'] as $status) {
+                    $result['statuses'][$pipeline['id']][$status['name']] = $status['id'];
+                }
+            }
+        }
+
+        writeLog("Успешно получены данные о воронках и статусах", "SUCCESS");
+        return $result;
+    } catch (Exception $e) {
+        writeLog("Ошибка при получении воронок и статусов: " . $e->getMessage(), "ERROR");
+        return null;
+    }
+}
+
+/**
+ * Обновляет статус сделок с бюджетом > 5000 из "Заявка" в "Ожидание клиента"
+ *
+ * @param AmoCrmV4Client $amoV4Client Клиент AmoCRM
+ * @param array $pipelineData Данные о воронках и статусах
+ * @return void
+ */
+function updateLeadsOnBudget(AmoCrmV4Client $amoV4Client, array $pipelineData) {
+    writeLog("Запуск функции updateLeadsOnBudget...");
+
+    try {
+        // Находим ID воронки "Воронка"
+        $pipelineId = $pipelineData['pipelines']['Воронка'] ?? null;
+        if (!$pipelineId) {
+            writeLog("Воронка с названием 'Воронка' не найдена", "ERROR");
+            return;
+        }
+        // Находим ID статусов
+        $applicationStatusId = $pipelineData['statuses'][$pipelineId]['Заявка'] ?? null;
+        $waitingClientStatusId = $pipelineData['statuses'][$pipelineId]['Ожидание клиента'] ?? null;
+
+        if (!$applicationStatusId || !$waitingClientStatusId) {
+            writeLog("Не найдены необходимые статусы в воронке", "ERROR");
+            return;
+        }
+
+        writeLog("Получение сделок на этапе 'Заявка' в воронке 'Воронка'...");
+
+        // Получаем сделки на этапе "Заявка"
+        $leadsClientApplication = $amoV4Client->GETAll("leads", [
+            "filter[statuses][0][pipeline_id]" => $pipelineId,
+            "filter[statuses][0][status_id]" => $applicationStatusId
+        ]);
+
+        if (empty($leadsClientApplication)) {
+            writeLog("Не найдено сделок на этапе 'Заявка'", "INFO");
+            return;
+        }
+
+        writeLog("Найдено сделок: " . count($leadsClientApplication));
+        $updatedCount = 0;
+
+        // Перебираем сделки и обновляем статус если бюджет > 5000
+        foreach ($leadsClientApplication as $lead) {
+            // Проверка наличия поля price
+            if (!isset($lead['price'])) {
+                writeLog("Сделка ID: {$lead['id']} не имеет поля 'price', пропускаем", "WARNING");
+                continue;
+            }
+
+            if ($lead['price'] > 5000) {
+                writeLog("Обработка сделки ID: {$lead['id']}, название: '{$lead['name']}', бюджет: {$lead['price']}");
+                try {
+                    $result = $amoV4Client->POSTRequestApi("leads/{$lead['id']}", [
+                        "status_id" => $waitingClientStatusId
+                    ], "PATCH");
+                    if ($result) {
+                        $updatedCount++;
+                        writeLog("Сделка ID: {$lead['id']} успешно перемещена на этап 'Ожидание клиента'", "SUCCESS");
+                    } else {
+                        writeLog("Ошибка при обновлении сделки ID: {$lead['id']}", "ERROR");
+                    }
+                } catch (Exception $e) {
+                    writeLog("Ошибка при обновлении сделки ID: {$lead['id']}: " . $e->getMessage(), "ERROR");
+                }
+            }
+        }
+        writeLog("Функция updateLeadsOnBudget завершена. Обновлено сделок: $updatedCount", "SUCCESS");
+    } catch (Exception $e) {
+        writeLog("Ошибка в функции updateLeadsOnBudget: " . $e->getMessage(), "ERROR");
+    }
+}
+
+/**
+ * Копирует сделки с бюджетом 4999 с этапа "Клиент подтвердил" на этап "Ожидание клиента"
+ *
+ * @param AmoCrmV4Client $amoV4Client Клиент AmoCRM
+ * @param array $pipelineData Данные о воронках и статусах
+ * @return void
+ */
+function copyLeadsOnBudget(AmoCrmV4Client $amoV4Client, array $pipelineData) {
+    writeLog("Запуск функции copyLeadsOnBudget...");
+
+    try {
+        // Находим ID воронки "Воронка"
+        $pipelineId = $pipelineData['pipelines']['Воронка'] ?? null;
+        if (!$pipelineId) {
+            writeLog("Воронка с названием 'Воронка' не найдена", "ERROR");
+            return;
+        }
+
+        // Находим ID статусов
+        $clientConfirmedStatusId = $pipelineData['statuses'][$pipelineId]['Клиент подтвердил'] ?? null;
+        $waitingClientStatusId = $pipelineData['statuses'][$pipelineId]['Ожидание клиента'] ?? null;
+
+        if (!$clientConfirmedStatusId || !$waitingClientStatusId) {
+            writeLog("Не найдены необходимые статусы в воронке", "ERROR");
+            return;
+        }
+        writeLog("Получение сделок на этапе 'Клиент подтвердил' с бюджетом 4999...");
+
+        // Получаем сделки на этапе "Клиент подтвердил" с бюджетом 4999
+        $leadsClientConfirmation = $amoV4Client->GETAll("leads", [
+            "filter[statuses][0][pipeline_id]" => $pipelineId,
+            "filter[statuses][0][status_id]" => $clientConfirmedStatusId,
+            "filter[price]" => 4999
+        ]);
+
+        if (empty($leadsClientConfirmation)) {
+            writeLog("Не найдено сделок на этапе 'Клиент подтвердил' с бюджетом 4999", "INFO");
+            return;
+        }
+        writeLog("Найдено сделок для копирования: " . count($leadsClientConfirmation));
+        $copiedCount = 0;
+
+        foreach ($leadsClientConfirmation as $lead) {
+            writeLog("Обработка сделки ID: {$lead['id']}, название: '{$lead['name']}'");
+
+            try {
+                // Получаем все custom fields сделки для полного копирования
+                $leadDetails = $amoV4Client->GETRequestApi("leads/{$lead['id']}");
+
+                // Получаем примечания к сделке
+                $notes = $amoV4Client->GETRequestApi("leads/{$lead['id']}/notes");
+                $notesData = $notes['_embedded']['notes'] ?? [];
+                writeLog("Найдено примечаний: " . count($notesData));
+                // Получаем задачи сделки
+                $tasks = $amoV4Client->GETRequestApi("tasks", [
+                    "filter[entity_id]" => $lead['id'],
+                    "filter[entity_type]" => "leads"
+                ]);
+                $tasksData = $tasks['_embedded']['tasks'] ?? [];
+                writeLog("Найдено задач: " . count($tasksData));
+
+                // Подготавливаем данные для создания новой сделки
+                $newLeadData = [
+                    "name" => $lead["name"] . " (копия)",
+                    "price" => $lead["price"],
+                    "status_id" => $waitingClientStatusId,
+                    "pipeline_id" => $pipelineId
+                ];
+
+                // Копируем custom fields, если они есть
+                if (isset($leadDetails['custom_fields_values'])) {
+                    $newLeadData['custom_fields_values'] = $leadDetails['custom_fields_values'];
+                }
+
+                // Копируем связанные контакты и компании
+                $newLeadData['_embedded'] = [];
+
+                if (isset($lead["_embedded"]["contacts"]) && !empty($lead["_embedded"]["contacts"])) {//проверяем есть ли связанные контакты и НЕ пустые ли они
+                    $newLeadData['_embedded']["contacts"] = array_map(function ($contact) {
+                        return ['id' => $contact['id']];
+                    }, $lead["_embedded"]["contacts"]);
+                }
+
+                if (isset($lead["_embedded"]["companies"]) && !empty($lead["_embedded"]["companies"])) {
+                    $newLeadData['_embedded']["companies"] = array_map(function ($company) {
+                        return ['id' => $company['id']];
+                    }, $lead["_embedded"]["companies"]);
+                }
+
+                // Создаем новую сделку
+                $newLead = $amoV4Client->POSTRequestApi("leads", [$newLeadData]);
+
+                if (!isset($newLead['_embedded']['leads'][0]['id'])) {
+                    writeLog("Ошибка при создании копии сделки ID: {$lead['id']}", "ERROR");
+                    continue; //переход к следующему циклу
+                }
+
+                $newLeadId = $newLead['_embedded']['leads'][0]['id'];
+                writeLog("Создана новая сделка с ID: $newLeadId");
+
+                // Копируем примечания
+                foreach ($notesData as $note) {
+                    if (isset($note['note_type'])) {
+                        $noteData = [
+                            "note_type" => $note["note_type"]
+                        ];
+                        switch ($note["note_type"]) {
+                            case "common":
+                                $noteData["params"] = ["text" => $note["params"]["text"]];
+                                break;
+                            case "call_in": //входящий звонок
+                            case "call_out": //исходящий звонок
+                            if (isset($note["params"])) {
+                                    $noteData["params"] = $note["params"];
+                                }
+                                break;
+                            case "attachment":  // Примечания с файлом
+                                // Проверяем, что параметры для файла присутствуют
+                                if (isset($note["params"]["file_uuid"]) && isset($note["params"]["file_name"])) {
+                                    $noteData["params"] = [
+                                        "text" => $note["params"]["text"],
+                                        "file_uuid" => $note["params"]["file_uuid"],
+                                        "file_name" => $note["params"]["file_name"],
+                                        "version_uuid" => $note["params"]["version_uuid"] ?? null, // Передаем UUID версии, если он есть
+                                        "original_name" => $note["params"]["original_name"] ?? null, // Если оригинальное имя файла есть
+                                        "is_drive_attachment" => $note["params"]["is_drive_attachment"] ?? 0 // Флаг для Google Drive, если есть
+                                    ];
+                                } else {
+                                    writeLog("Ошибка: недостающие параметры для примечания с файлом (file_uuid, file_name).", "ERROR");
+                                }
+                                break;
+                        }
+                        $noteResult = $amoV4Client->POSTRequestApi("leads/$newLeadId/notes", [$noteData]);
+                        if ($noteResult) {
+                            writeLog("Примечание успешно скопировано", "SUCCESS");
+                        }
+                    }
+                }
+
+                // Копируем задачи
+                foreach ($tasksData as $task) {
+                    $taskData = [
+                        "text" => $task["text"],
+                        "complete_till" => $task["complete_till"],
+                        "entity_id" => $newLeadId,
+                        "entity_type" => "leads"
+                    ];
+
+                    if (isset($task["responsible_user_id"])) {
+                        $taskData["responsible_user_id"] = $task["responsible_user_id"];
+                    }
+
+                    $taskResult = $amoV4Client->POSTRequestApi("tasks", [$taskData]);
+                    if ($taskResult) {
+                        writeLog("Задача успешно скопирована", "SUCCESS");
+                    }
+                }
+                $copiedCount++;
+                writeLog("Сделка ID: {$lead['id']} успешно скопирована", "SUCCESS");
+
+            } catch (Exception $e) {
+                writeLog("Ошибка при копировании сделки ID: {$lead['id']}: " . $e->getMessage(), "ERROR");
+            }
+        }
+
+        writeLog("Функция copyLeadsOnBudget завершена. Скопировано сделок: $copiedCount", "SUCCESS");
+    } catch (Exception $e) {
+        writeLog("Ошибка в функции copyLeadsOnBudget: " . $e->getMessage(), "ERROR");
+    }
+}
 
 try {
 
     $amoV4Client = new AmoCrmV4Client(SUB_DOMAIN, CLIENT_ID, CLIENT_SECRET, CODE, REDIRECT_URL);
-    function updateLeadsOnBudget($amoV4Client)
-    {
-        //Перенос сделок с бюджетом > 5000 из "Заявка" в "Ожидание клиента"
-        $leadsClientApplication = $amoV4Client->GETAll("leads", [
-            "filter[statuses][0][pipeline_id]" => 9537262, //id Воронка
-            "filter[statuses][0][status_id]" => 76225426 //id Заявка
-        ]);
 
-        array_filter( $leadsClientApplication, function ($lead) use ($amoV4Client) { // использование анонимной функции
-            if ($lead['price'] > 5000) {
-                $amoV4Client->POSTRequestApi("leads/{$lead['id']}", [
-                    "status_id" => 76225434 //id Ожидание клиента
-                ], "PATCH"); //метод "PATCH" редактирование сделок
-            }
-        });
+    // Получаем данные о воронках и статусах
+    $pipelineData = getPipelinesAndStatuses($amoV4Client);
+    if (!$pipelineData) {
+        throw new Exception("Не удалось получить данные о воронках и статусах");
     }
 
-    function copyLeadsOnBudget($amoV4Client)
-    {
-        // копирование сделки на этапе “Клиент подтвердил” при условии, что бюджет сделки = равен 4999
-        $leadsClientConfirmation = $amoV4Client->GETAll("leads", [
-            "filter[statuses][0][pipeline_id]" => 9537262,
-            "filter[statuses][0][status_id]" => 76234074,
-            "filter[price]" => 4999 // Фильтр по цене
-        ]);
+    // Вызываем функции обработки сделок
+    updateLeadsOnBudget($amoV4Client, $pipelineData);
+    copyLeadsOnBudget($amoV4Client, $pipelineData);
 
-        foreach ($leadsClientConfirmation as $lead) {
-
-            $notes = $amoV4Client->GETRequestApi("leads/{$lead['id']}/notes"); //получение примечаний
-            $tasks = $amoV4Client->GETRequestApi("tasks", [ // получение задач
-                "filter[entity_id]" => $lead['id'], // id сделки
-                "filter[entity_type]" => "leads" // тип сущности
-            ]);
-
-            $newLead = $amoV4Client->POSTRequestApi("leads", [[ // создание копии-сделки
-                "name" => $lead["name"] . " (копия)",
-                "price" => $lead["price"],
-                "status_id" => 76225434, //создание на этапе "Ожидание клиента"
-                "pipeline_id" => $lead["pipeline_id"] , // воронка
-                "_embedded" => [
-                    "contacts" => array_map(function ($contact) {
-                        return ['id' => $contact['id']]; //  id контактов
-                    }, $lead["_embedded"]["contacts"]),
-                    "companies" => array_map(function ($company) {
-                        return ['id' => $company['id']]; //  id компаний
-                    }, $lead["_embedded"]["companies"])
-                ]
-            ]]);
-            $newLeadId = $newLead['_embedded']['leads'][0]['id']; // id новой сделки
-
-            array_filter($notes['_embedded']['notes'], function ($note) use ($newLeadId, $amoV4Client) {
-                if (isset($note['note_type']) && $note['note_type'] === 'common') { // проверка
-                    $amoV4Client->POSTRequestApi("leads/$newLeadId/notes", [[
-                        "note_type" => "common",
-                        "params" => ["text" => $note["params"]["text"]] //берем текст из старой сделки
-                    ]]);
-                }
-            });
-
-            array_filter($tasks['_embedded']['tasks'], function ($task) use ($newLeadId, $amoV4Client) {
-                $amoV4Client->POSTRequestApi("tasks", [[ //Создание копии задач из сделки-донора с сохранением всех данных и прикрепить новые задачи к сделке.
-                    "text" => $task["text"],
-                    "complete_till" => $task["complete_till"],
-                    "entity_id" => $newLeadId,
-                    "entity_type" => "leads",
-                    "responsible_user_id" => $task["responsible_user_id"]
-                ]]);
-            });
-        }
-
-
-    }
-
-    updateLeadsOnBudget($amoV4Client); // вызываем функции
-    copyLeadsOnBudget($amoV4Client);
-    echo "\nГотово!\n";
 }
-
-
-catch (Exception $ex) {
-    var_dump($ex);
-    file_put_contents("ERROR_LOG.txt", 'Ошибка: ' . $ex->getMessage() . PHP_EOL . 'Код ошибки:' . $ex->getCode());
+catch (Exception $e) {
+    file_put_contents("ERROR_LOG.txt", 'Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки:' . $e->getCode());
+    echo "\nПроизошла ошибка при выполнении скрипта. Подробности в логах.\n";
 }
